@@ -15,7 +15,8 @@ echo "==> 构建 snapflow $VERSION"
 mkdir -p "$BUILD/DEBIAN" "$BUILD/usr/bin" "$BUILD/usr/share/snapflow" \
          "$BUILD/usr/share/applications" \
          "$BUILD/usr/share/icons/hicolor/128x128/apps" \
-         "$BUILD/usr/share/doc/snapflow"
+         "$BUILD/usr/share/doc/snapflow" \
+         "$BUILD/etc/xdg/autostart"
 
 cp -r snapflow "$BUILD/usr/share/snapflow/"
 cp main.py "$BUILD/usr/share/snapflow/"
@@ -53,11 +54,25 @@ Name=Snapflow
 Name[zh_CN]=Snapflow 截图
 Comment=Screenshot with annotation (X11 & Wayland)
 Comment[zh_CN]=截图与标注工具（支持 X11 与 Wayland）
-Exec=snapflow capture
+Exec=snapflow trigger
 Icon=snapflow
 Categories=Utility;Graphics;
 Keywords=screenshot;capture;annotation;截图;
 StartupNotify=false
+EOF
+
+# 常驻触发器：登录后自动启动，快捷键只发一条本地消息，避免冷启动
+cat > "$BUILD/etc/xdg/autostart/snapflow.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Snapflow Daemon
+Name[zh_CN]=Snapflow 后台服务
+Comment=Warm trigger service for the Snapflow screenshot tool
+Comment[zh_CN]=截图工具 Snapflow 的常驻触发器
+Exec=snapflow daemon
+Icon=snapflow
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
 EOF
 
 cat > "$BUILD/DEBIAN/control" <<EOF

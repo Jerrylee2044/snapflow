@@ -52,11 +52,16 @@ python3 main.py capture       # 立即截一次
 ## 使用
 
 ```bash
-snapflow capture              # 立即截图（任何会话，适合绑定快捷键）
-snapflow daemon               # X11 常驻热键，默认 Ctrl+Shift+A
-snapflow daemon --hotkey Print  # 换成 PrintScreen
+snapflow trigger              # 通知常驻 daemon 截图（桌面快捷键绑定这个，响应最快）
+snapflow daemon               # 常驻：本地 socket + X11 全局热键
+snapflow daemon --hotkey Print  # X11 换成 PrintScreen
+snapflow capture              # 立即截一次（进程内完成，适合测试/无 daemon 环境）
 python3 -m snapflow capture   # 源码方式运行
 ```
+
+安装 deb 后，登录时会通过 `/etc/xdg/autostart/snapflow.desktop` 自动拉起
+`snapflow daemon`。快捷键只发一条本地 socket 消息（~1ms），截图立即开始，
+省掉每次冷启动 Python/Qt 的 300–500ms。
 
 ### 操作与快捷键
 
@@ -74,7 +79,7 @@ python3 -m snapflow capture   # 源码方式运行
 
 ### 绑定全局快捷键
 
-**GNOME（Wayland 推荐）**，把 `Alt+A` 绑定到 `snapflow capture`：
+**GNOME（Wayland 推荐）**，把 `Alt+A` 绑定到 `snapflow trigger`：
 
 ```bash
 gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings \
@@ -82,7 +87,7 @@ gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings \
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1/ \
   name 'Snapflow 截图'
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1/ \
-  command 'snapflow capture'
+  command 'snapflow trigger'
 gsettings set org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom1/ \
   binding '<Alt>a'
 ```
@@ -103,6 +108,19 @@ KDE：系统设置 → 快捷键 → 自定义快捷键。
 | `mss` | X11 原生 | Wayland 下经 XWayland 只能抓到黑图，会被黑图守卫拒绝 |
 
 无论走哪个后端，拿到全屏图后一律进入 snapflow 自己的框选层。
+
+### 关于 GNOME 的截图快门闪光
+
+在 GNOME Wayland 下按快捷键后，屏幕会闪一下才出现选框——这是 GNOME 的
+**截图快门动画**，不是 snapflow 造成的，也无法通过 API 关闭：
+`xdg-desktop-portal-gnome` 调用 shell 截图时把 flash 参数硬编码为 `TRUE`
+（[screenshotdialog.c](https://github.com/GNOME/xdg-desktop-portal-gnome/blob/main/src/screenshotdialog.c)），
+Portal 协议也没有对应的选项。
+
+snapflow 能做的是把闪光前后的等待压到最短：常驻 daemon 让触发只需一条
+本地消息，授权缓存后跳过焦点窗口等待，实测按 `Alt+A` 到可框选约 0.5–0.6 秒
+（其中绝大部分是 GNOME Portal 自身的截图耗时）。
+如果你需要真正零闪烁、零延迟的截图，X11 会话下的 mss 后端是首选。
 
 ### GNOME 首次使用的授权弹窗
 
@@ -159,6 +177,7 @@ snapflow/
 ├── app.py             # 流程控制器：抓屏 → 覆盖层 → 复制/保存
 ├── clipboard.py       # wl-copy / xclip / Qt 三级兜底
 ├── hotkey.py          # X11 全局热键（ctypes 直调 XGrabKey）
+├── ipc.py             # 常驻 daemon 的本地 socket 触发器（快捷键 → daemon）
 ├── plugins/           # 插件协议与注册表
 └── __main__.py        # CLI：capture / daemon
 ```

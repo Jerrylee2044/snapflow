@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 
 from PyQt6.QtCore import QEventLoop, QObject, Qt, QTimer
 from PyQt6.QtGui import QImage
@@ -29,6 +30,7 @@ class SnapflowApp(QObject):
         self.one_shot = one_shot
         self._busy = False
         self._overlay: CaptureOverlay | None = None
+        self._portal_permission: bool | None = None
 
         self._backends: list[ScreenBackend] = candidate_backends()
         log.info("截图后端候选：%s",
@@ -42,12 +44,14 @@ class SnapflowApp(QObject):
             log.debug("已有截图流程进行中，忽略本次触发")
             return
         self._busy = True
+        started = time.monotonic()
         helper = self._focus_helper_for_portal()
         shot = self._grab()
         if helper is not None:
             helper.close()
         if shot is None:
             return
+        log.info("抓屏完成：%.0f ms", (time.monotonic() - started) * 1000)
         shot = self.plugins.on_captured(shot)
         self._open_overlay(shot)
 
@@ -55,13 +59,14 @@ class SnapflowApp(QObject):
         """Portal 要求调用方持有焦点窗口，否则 GNOME 无法弹授权框。
 
         由快捷键启动时没有前台窗口，先显示一个 1x1 透明窗口取得焦点，
-        截图完成后关闭。授权已缓存的情况下静默截图本就会成功，
-        这只是首跑授权场景的兜底。
+        截图完成后关闭。授权已缓存时不需要该窗口，直接跳过以省掉等待。
         """
         import os
         if not os.environ.get("WAYLAND_DISPLAY"):
             return None
         if not self._backends or self._backends[0].name != "xdg-portal":
+            return None
+        if self._portal_permission_cached():
             return None
         helper = QWidget(
             None,
@@ -128,6 +133,41 @@ class SnapflowApp(QObject):
     def _maybe_quit(self) -> None:
         if self.one_shot:
             QApplication.quit()
+
+    # ---- Portal 权限缓存 ----
+
+    def _portal_permission_cached(self) -> bool:
+        """查询权限存储：snapflow 是否已被授予截图权限（结果进程内缓存）。"""
+        if self._portal_permission is not None:
+            return self._portal_permission
+        try:
+            import asyncio
+
+            async def lookup() -> bool:
+                from dbus_next import BusType, Message, MessageType
+                from dbus_next.aio import MessageBus
+
+                bus = await MessageBus(bus_type=BusType.SESSION).connect()
+                try:
+                    reply = await bus.call(Message(
+                        destination="org.freedesktop.impl.portal.PermissionStore",
+                        path="/org/freedesktop/impl/portal/PermissionStore",
+                        interface="org.freedesktop.impl.portal.PermissionStore",
+                        member="Lookup", signature="ss",
+                        body=["screenshot", "screenshot"]))
+                finally:
+                    bus.disconnect()
+                if reply.message_type is not MessageType.METHOD_RETURN:
+                    return False
+                permissions = reply.body[0] if reply.body else {}
+                return "yes" in permissions.get("snapflow", [])
+
+            self._portal_permission = asyncio.run(lookup())
+        except Exception:  # noqa: BLE001 - 查询失败就按"未授权"处理
+            log.debug("查询 Portal 权限失败", exc_info=True)
+            self._portal_permission = False
+        log.info("Portal 截图授权已缓存：%s", self._portal_permission)
+        return self._portal_permission
 
 
 def create_qapp() -> QApplication:
