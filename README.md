@@ -1,5 +1,8 @@
 # snapflow
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/Jerrylee2044/snapflow)](https://github.com/Jerrylee2044/snapflow/releases)
+
 Ubuntu 桌面截图工具：**X11 优先（mss），Wayland 经 XDG Portal / grim 兜底**。
 
 微信式单层交互——拖拽框选后工具条直接出现在选区旁，矩形、箭头、文字、马赛克
@@ -27,7 +30,8 @@ Alt+A（可自定义） → 拖拽框选 → 标注 → Enter 复制 / Ctrl+Ente
 
 ### deb 包（推荐）
 
-从 [Releases](../../releases) 下载 `snapflow_x.y.z-1_all.deb`：
+从 [Releases](https://github.com/Jerrylee2044/snapflow/releases) 下载
+`snapflow_x.y.z-1_all.deb`：
 
 ```bash
 sudo apt install ./snapflow_0.1.1-1_all.deb   # 自动处理依赖
@@ -41,7 +45,7 @@ sudo apt install ./snapflow_0.1.1-1_all.deb   # 自动处理依赖
 sudo apt install python3-pyqt6 python3-dbus-next python3-pip grim wl-clipboard xclip
 pip install --user mss        # mss 不在 apt 源中；遇 PEP 668 报错加 --break-system-packages
 
-git clone <本仓库地址> && cd snapflow
+git clone https://github.com/Jerrylee2044/snapflow.git && cd snapflow
 python3 main.py capture       # 立即截一次
 ```
 
