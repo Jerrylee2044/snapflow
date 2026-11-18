@@ -144,6 +144,26 @@ check("马赛克生效", center.name() not in ("#ffffff", "#000000"))
 overlay.undo()
 check("撤销", len(overlay.annotations) == 2)
 
+# 选区调整：拖右下角手柄放大，标注保留
+before = QRectF(overlay._selection)
+corner = QPoint(round(before.right()), round(before.bottom()))
+QTest.mousePress(overlay, Qt.MouseButton.LeftButton, pos=corner)
+QTest.mouseMove(overlay, QPoint(corner.x() + 40, corner.y() + 30))
+QTest.mouseRelease(overlay, Qt.MouseButton.LeftButton,
+                   pos=QPoint(corner.x() + 40, corner.y() + 30))
+check("拖角调整选区",
+      overlay._selection.width() > before.width() + 30
+      and overlay._selection.height() > before.height() + 20)
+check("调整后标注保留", len(overlay.annotations) == 2)
+
+# 选区外拖拽 = 重新框选（清空旧标注）
+QTest.mousePress(overlay, Qt.MouseButton.LeftButton, pos=QPoint(10, 10))
+QTest.mouseMove(overlay, QPoint(90, 70))
+QTest.mouseRelease(overlay, Qt.MouseButton.LeftButton, pos=QPoint(90, 70))
+check("框外拖拽重新框选",
+      overlay._editing and len(overlay.annotations) == 0
+      and overlay._selection.width() > 10)
+
 # Esc 取消路径
 cancelled = []
 overlay.cancelled.connect(lambda: cancelled.append(1))

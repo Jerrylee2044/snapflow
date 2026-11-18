@@ -86,6 +86,12 @@ class CaptureOverlay(QWidget):
         self._text_edit: QLineEdit | None = None
         self._text_img_pos: QPointF | None = None
 
+        # ---- 选区调整状态（逻辑坐标） ----
+        self._resize_handle: str | None = None
+        self._resize_rect0 = QRectF()
+        self.HANDLE_SIZE = 8.0
+        self.MIN_SELECTION = 24.0
+
         self._toolbar = self._build_toolbar()
         self._toolbar.hide()
 
@@ -201,6 +207,16 @@ class CaptureOverlay(QWidget):
             self._selection = QRectF(pos, pos)
             self.update()
             return
+        # 调整选区：先命中边框/角上的手柄
+        handle = self._hit_handle(pos)
+        if handle is not None:
+            self._resize_handle = handle
+            self._resize_rect0 = QRectF(self._selection)
+            return
+        # 选区外按拖拽 = 重新框选
+        if not self._selection.contains(pos):
+            self._start_new_selection(pos)
+            return
         # 标注模式
         img_pos = self._to_image(self._clamp_to_selection(pos))
         if self.tool == TOOL_TEXT:
@@ -212,16 +228,28 @@ class CaptureOverlay(QWidget):
 
     def mouseMoveEvent(self, event) -> None:
         pos = event.position()
-        if self._dragging:
+        if self._resize_handle is not None:
+            self._apply_resize(pos)
+            self._place_toolbar()
+            self.update()
+        elif self._dragging:
             self._selection = QRectF(self._origin, pos).normalized()
             self.update()
         elif self._draft is not None and self._press_img is not None:
             img_pos = self._to_image(self._clamp_to_selection(pos))
             self._draft = self._make_draft(self._press_img, img_pos)
             self.update()
+        else:
+            self._update_hover_cursor(pos)
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._resize_handle is not None:
+            self._apply_resize(event.position())
+            self._resize_handle = None
+            self._place_toolbar()
+            self.update()
             return
         if self._dragging:
             self._dragging = False
@@ -242,6 +270,83 @@ class CaptureOverlay(QWidget):
             self._draft = None
             self._press_img = None
             self.update()
+
+    # ---- 选区调整 ----
+
+    def _start_new_selection(self, pos: QPointF) -> None:
+        """在选区外拖拽：放弃当前选区与标注，重新框选。"""
+        self._commit_text_edit()
+        self._resize_handle = None
+        self._editing = False
+        self._toolbar.hide()
+        self._selection = QRectF(pos, pos)
+        self._origin = pos
+        self._dragging = True
+        self.annotations.clear()
+        self._draft = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+
+    def _hit_handle(self, pos: QPointF) -> str | None:
+        if not self._editing or self._selection.isEmpty():
+            return None
+        r = self._selection
+        h = self.HANDLE_SIZE
+        x, y = pos.x(), pos.y()
+        if not (r.left() - h <= x <= r.right() + h
+                and r.top() - h <= y <= r.bottom() + h):
+            return None
+        near_l = abs(x - r.left()) <= h
+        near_r = abs(x - r.right()) <= h
+        near_t = abs(y - r.top()) <= h
+        near_b = abs(y - r.bottom()) <= h
+        if near_l and near_t:
+            return "nw"
+        if near_r and near_t:
+            return "ne"
+        if near_l and near_b:
+            return "sw"
+        if near_r and near_b:
+            return "se"
+        if near_l:
+            return "w"
+        if near_r:
+            return "e"
+        if near_t:
+            return "n"
+        if near_b:
+            return "s"
+        return None
+
+    def _apply_resize(self, pos: QPointF) -> None:
+        r = QRectF(self._resize_rect0)
+        x = min(max(pos.x(), 0.0), float(self.width()))
+        y = min(max(pos.y(), 0.0), float(self.height()))
+        m = self.MIN_SELECTION
+        handle = self._resize_handle or ""
+        if "w" in handle:
+            r.setLeft(min(x, r.right() - m))
+        if "e" in handle:
+            r.setRight(max(x, r.left() + m))
+        if "n" in handle:
+            r.setTop(min(y, r.bottom() - m))
+        if "s" in handle:
+            r.setBottom(max(y, r.top() + m))
+        self._selection = r
+
+    def _update_hover_cursor(self, pos: QPointF) -> None:
+        handle = self._hit_handle(pos)
+        cursors = {
+            "nw": Qt.CursorShape.SizeFDiagCursor,
+            "se": Qt.CursorShape.SizeFDiagCursor,
+            "ne": Qt.CursorShape.SizeBDiagCursor,
+            "sw": Qt.CursorShape.SizeBDiagCursor,
+            "n": Qt.CursorShape.SizeVerCursor,
+            "s": Qt.CursorShape.SizeVerCursor,
+            "e": Qt.CursorShape.SizeHorCursor,
+            "w": Qt.CursorShape.SizeHorCursor,
+        }
+        self.setCursor(cursors.get(handle, Qt.CursorShape.CrossCursor))
 
     # ================= 标注构造 =================
 
@@ -355,12 +460,28 @@ class CaptureOverlay(QWidget):
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.drawRect(rect)
 
+            if self._editing:
+                painter.setPen(QPen(QColor("#0a84ff"), 1))
+                painter.setBrush(QColor("white"))
+                for point in self._handle_points():
+                    painter.drawRect(QRectF(point.x() - 3, point.y() - 3, 6, 6))
+
             w = round(rect.width() * s)
             h = round(rect.height() * s)
             painter.setPen(QColor("white"))
             painter.drawText(rect.topLeft() + QPointF(4, -6),
                              f"{w} × {h}")
         painter.end()
+
+    def _handle_points(self) -> list[QPointF]:
+        r = self._selection
+        cx, cy = r.center().x(), r.center().y()
+        return [
+            QPointF(r.left(), r.top()), QPointF(cx, r.top()),
+            QPointF(r.right(), r.top()), QPointF(r.right(), cy),
+            QPointF(r.right(), r.bottom()), QPointF(cx, r.bottom()),
+            QPointF(r.left(), r.bottom()), QPointF(r.left(), cy),
+        ]
 
     # ================= 输出 =================
 

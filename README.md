@@ -68,6 +68,8 @@ python3 -m snapflow capture   # 源码方式运行
 | 操作 | 说明 |
 | --- | --- |
 | 拖拽 | 框选截图区域，松手后选区旁出现工具条 |
+| 拖拽选区边框/角 | 调整选区大小（8 个手柄，标注保留） |
+| 在选区外拖拽 | 重新框选（清空已有标注） |
 | 工具条 | 矩形 / 箭头 / 文字 / 马赛克，6 色预选，撤销、保存、完成 |
 | 文字工具 | 点击选区后直接输入，回车确认 |
 | **Enter** | 复制到剪贴板并退出 |
@@ -111,16 +113,25 @@ KDE：系统设置 → 快捷键 → 自定义快捷键。
 
 ### 关于 GNOME 的截图快门闪光
 
-在 GNOME Wayland 下按快捷键后，屏幕会闪一下才出现选框——这是 GNOME 的
-**截图快门动画**，不是 snapflow 造成的，也无法通过 API 关闭：
-`xdg-desktop-portal-gnome` 调用 shell 截图时把 flash 参数硬编码为 `TRUE`
+GNOME 的 Portal 截图实现把 flash 参数硬编码为 `TRUE`
 （[screenshotdialog.c](https://github.com/GNOME/xdg-desktop-portal-gnome/blob/main/src/screenshotdialog.c)），
-Portal 协议也没有对应的选项。
+Portal 协议没有关闭选项，所以快门的**音效**无法从应用侧阻止——它是系统事件音。
 
-snapflow 能做的是把闪光前后的等待压到最短：常驻 daemon 让触发只需一条
-本地消息，授权缓存后跳过焦点窗口等待，实测按 `Alt+A` 到可框选约 0.5–0.6 秒
-（其中绝大部分是 GNOME Portal 自身的截图耗时）。
-如果你需要真正零闪烁、零延迟的截图，X11 会话下的 mss 后端是首选。
+**但闪光和窗口打开动画可以跳过**：它们是 St 的 `ease` 动画，而 St 在
+`org.gnome.desktop.interface enable-animations=false` 时把动画时长归零。
+snapflow 默认在截图瞬间临时关闭系统动画，覆盖层出现 150ms 后自动恢复，
+因此看不到快门闪光和窗口缩放。该行为可关闭：
+
+```jsonc
+// ~/.config/snapflow/config.json
+{ "suppress_shutter_flash": false }
+```
+
+实现带 `atexit` 兜底，即使进程异常退出也会恢复动画设置。
+如果你需要真正零闪烁且零延迟，X11 会话下的 mss 后端仍是首选。
+
+snapflow 还会把闪光前后的等待压到最短：常驻 daemon 让触发只需一条
+本地消息，授权缓存后跳过焦点窗口等待，实测按 `Alt+A` 到可框选约 0.5–0.6 秒。
 
 ### GNOME 首次使用的授权弹窗
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import sys
 import time
+import atexit
 
 from PyQt6.QtCore import QEventLoop, QObject, Qt, QTimer
 from PyQt6.QtGui import QImage
@@ -12,10 +13,15 @@ from PyQt6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from .backends import candidate_backends
 from .backends.base import CaptureCancelled, CaptureError, ScreenBackend
+from . import config
 from .plugins import PluginRegistry
 from .ui import CaptureOverlay
 
 log = logging.getLogger(__name__)
+
+
+def _noop() -> None:
+    return None
 
 
 class SnapflowApp(QObject):
@@ -31,6 +37,9 @@ class SnapflowApp(QObject):
         self._busy = False
         self._overlay: CaptureOverlay | None = None
         self._portal_permission: bool | None = None
+        self._pending_restore = None
+        self._config = config.load()
+        atexit.register(self._restore_pending_animations)
 
         self._backends: list[ScreenBackend] = candidate_backends()
         log.info("截图后端候选：%s",
@@ -45,15 +54,69 @@ class SnapflowApp(QObject):
             return
         self._busy = True
         started = time.monotonic()
+        restore_animations = self._suppress_animations()
         helper = self._focus_helper_for_portal()
         shot = self._grab()
         if helper is not None:
             helper.close()
         if shot is None:
+            restore_animations()
             return
         log.info("抓屏完成：%.0f ms", (time.monotonic() - started) * 1000)
         shot = self.plugins.on_captured(shot)
         self._open_overlay(shot)
+        # 等覆盖层完成映射后再恢复动画，避免窗口打开动画
+        QTimer.singleShot(150, restore_animations)
+
+    # ---- 快门闪光抑制 ----
+
+    def _suppress_animations(self):
+        """截图瞬间临时关闭 GNOME 系统动画，返回恢复函数。
+
+        GNOME 的快门闪光（Flashspot）与窗口打开动画都基于 St 的 ease，
+        enable-animations=false 时 St 会把动画时长归零，闪光与缩放动画
+        随之跳过。截图完成后恢复原值；即使进程异常也有 atexit 兜底。
+        """
+        if not self._config.get("suppress_shutter_flash", True):
+            return _noop
+        import os
+        if os.environ.get("XDG_SESSION_TYPE", "").lower() != "wayland":
+            return _noop
+        try:
+            import gi
+            gi.require_version("Gio", "2.0")
+            from gi.repository import Gio
+
+            settings = Gio.Settings.new("org.gnome.desktop.interface")
+            previous = settings.get_boolean("enable-animations")
+            if not previous:
+                return _noop
+            settings.set_boolean("enable-animations", False)
+            Gio.Settings.sync()
+        except Exception:  # noqa: BLE001 - 非 GNOME 或 gi 缺失时静默跳过
+            log.debug("无法临时关闭系统动画", exc_info=True)
+            return _noop
+
+        restored = False
+
+        def restore() -> None:
+            nonlocal restored
+            if restored:
+                return
+            restored = True
+            self._pending_restore = None
+            try:
+                settings.set_boolean("enable-animations", previous)
+                Gio.Settings.sync()
+            except Exception:  # noqa: BLE001
+                log.warning("恢复系统动画设置失败", exc_info=True)
+
+        self._pending_restore = restore
+        return restore
+
+    def _restore_pending_animations(self) -> None:
+        if self._pending_restore is not None:
+            self._pending_restore()
 
     def _focus_helper_for_portal(self) -> QWidget | None:
         """Portal 要求调用方持有焦点窗口，否则 GNOME 无法弹授权框。
