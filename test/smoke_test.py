@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from PyQt6.QtCore import QPoint, QPointF, QRectF, Qt
 from PyQt6.QtGui import QColor, QImage, QPainter
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QWidget
 
 from snapflow.annotations import (
     ArrowAnnotation, MosaicAnnotation, RectAnnotation, TextAnnotation,
@@ -188,6 +188,65 @@ cancelled = []
 overlay.cancelled.connect(lambda: cancelled.append(1))
 QTest.keyClick(overlay, Qt.Key.Key_Escape)
 check("Esc 取消", len(cancelled) == 1)
+
+# 2b. 交互与渲染优化：工具快捷键 / 右键取消 / 双击复制 / 文字框 Esc / 缓存渲染
+import snapflow.ui.overlay as overlay_mod
+
+ov2 = CaptureOverlay(base, PluginRegistry())
+ov2.resize(400, 300)
+ov2.show()
+QTest.mousePress(ov2, Qt.MouseButton.LeftButton, pos=QPoint(40, 40))
+QTest.mouseMove(ov2, QPoint(300, 240))
+QTest.mouseRelease(ov2, Qt.MouseButton.LeftButton, pos=QPoint(300, 240))
+check("新覆盖层框选", ov2._editing)
+QTest.keyClick(ov2, Qt.Key.Key_A)
+check("A 切换到箭头", ov2.tool == "arrow")
+QTest.keyClick(ov2, Qt.Key.Key_M)
+check("M 切换到马赛克", ov2.tool == "mosaic")
+QTest.keyClick(ov2, Qt.Key.Key_R)
+check("R 切换到矩形", ov2.tool == "rect")
+
+canvas = QImage(ov2.size(), QImage.Format.Format_ARGB32_Premultiplied)
+QWidget.render(ov2, canvas)
+check("缓存渲染：选区内保留原色",
+      QColor(canvas.pixel(150, 150)).name() == "#336699")
+check("缓存渲染：选区外被压暗",
+      QColor(canvas.pixel(10, 10)).red() < 0x33)
+
+cancelled2 = []
+ov3 = CaptureOverlay(base, PluginRegistry())
+ov3.resize(400, 300)
+ov3.show()
+ov3.cancelled.connect(lambda: cancelled2.append(1))
+QTest.mouseClick(ov3, Qt.MouseButton.RightButton, pos=QPoint(200, 150))
+check("右键取消", len(cancelled2) == 1)
+
+copied, finished = [], []
+real_copy_image = overlay_mod.copy_image
+overlay_mod.copy_image = lambda img: (copied.append(img.size()), True)[1]
+try:
+    ov4 = CaptureOverlay(base.copy(), PluginRegistry())
+    ov4.resize(400, 300)
+    ov4.show()
+    ov4.finished.connect(lambda: finished.append(1))
+    QTest.mousePress(ov4, Qt.MouseButton.LeftButton, pos=QPoint(40, 40))
+    QTest.mouseMove(ov4, QPoint(300, 240))
+    QTest.mouseRelease(ov4, Qt.MouseButton.LeftButton, pos=QPoint(300, 240))
+    QTest.mouseDClick(ov4, Qt.MouseButton.LeftButton, pos=QPoint(150, 150))
+    check("双击选区内复制", len(copied) == 1 and len(finished) == 1)
+finally:
+    overlay_mod.copy_image = real_copy_image
+
+ov5 = CaptureOverlay(base.copy(), PluginRegistry())
+ov5.resize(400, 300)
+ov5.show()
+ov5._set_tool("text")
+ov5._start_text_edit(QPointF(100, 100))
+edit = ov5._text_edit
+edit.setText("abc")
+QTest.keyClick(edit, Qt.Key.Key_Escape)
+check("文字框 Esc 丢弃输入",
+      ov5._text_edit is None and len(ov5.annotations) == 0)
 
 # 3. 插件钩子：加载临时插件目录
 with tempfile.TemporaryDirectory() as d:

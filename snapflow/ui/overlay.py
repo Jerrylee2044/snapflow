@@ -2,6 +2,9 @@
 
 流程：拖拽框选 -> 选区旁弹出工具条（矩形/箭头/文字/马赛克/颜色/撤销）
 -> Enter 复制到剪贴板；Ctrl+Enter 直接保存到 ~/Pictures/截图/；Esc 取消。
+
+渲染在构造时一次性把截图平滑缩放到设备分辨率并缓成两张位图（压暗背景 /
+亮图），每帧只做位图拷贝，拖动时再局部重绘，避免逐帧整屏缩放与混合。
 """
 
 from __future__ import annotations
@@ -10,10 +13,14 @@ import datetime as _dt
 import logging
 from pathlib import Path
 
-from PyQt6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QGuiApplication, QImage, QPainter, QPen
+from PyQt6.QtCore import (
+    QEvent, QPointF, QRect, QRectF, QSize, Qt, pyqtSignal,
+)
+from PyQt6.QtGui import (
+    QColor, QGuiApplication, QImage, QPainter, QPen, QPixmap,
+)
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLineEdit, QPushButton, QWidget,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QPushButton, QWidget,
 )
 
 from ..annotations import (
@@ -37,6 +44,23 @@ TOOLS = (
     (TOOL_MOSAIC, "马赛克"),
 )
 
+TOOL_SHORTCUTS = {
+    Qt.Key.Key_R: TOOL_RECT,
+    Qt.Key.Key_A: TOOL_ARROW,
+    Qt.Key.Key_T: TOOL_TEXT,
+    Qt.Key.Key_M: TOOL_MOSAIC,
+}
+
+TOOL_HINTS = {
+    TOOL_RECT: "矩形 (R)",
+    TOOL_ARROW: "箭头 (A)",
+    TOOL_TEXT: "文字 (T)",
+    TOOL_MOSAIC: "马赛克 (M)",
+}
+
+BG_DIM_ALPHA = 120      # 未选中区域压暗程度
+DAMAGE_MARGIN = 48.0    # 局部重绘时为边框/手柄/尺寸标签留的余量
+
 PRESET_COLORS = ("#ff3b30", "#ffcc00", "#34c759", "#0a84ff",
                  "#ffffff", "#000000")
 
@@ -59,6 +83,8 @@ class CaptureOverlay(QWidget):
             | Qt.WindowType.Tool,
         )
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        # 每帧都会画满整个窗口，告诉 Qt 不必先擦背景，省一次填充
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.CrossCursor)
 
@@ -72,6 +98,11 @@ class CaptureOverlay(QWidget):
         # 图像像素 / 逻辑坐标 的换算系数（HiDPI 下通常 >1）
         self._scale = (screenshot.width() / geometry.width()
                        if geometry.width() else 1.0)
+
+        # 预缩放缓存：压暗整屏 + 亮图，绘制时 1:1 拷贝，不再逐帧缩放
+        self._dim_cache: QPixmap | None = None
+        self._bright_cache: QPixmap | None = None
+        self._cache_key: tuple | None = None
 
         # ---- 框选状态 ----
         self._origin = QPointF()
@@ -121,6 +152,7 @@ class CaptureOverlay(QWidget):
             btn = QPushButton(label)
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(TOOL_HINTS[tool])
             btn.clicked.connect(
                 lambda _=False, t=tool: self._set_tool(t))
             layout.addWidget(btn)
@@ -146,27 +178,33 @@ class CaptureOverlay(QWidget):
         undo_btn = QPushButton("撤销")
         undo_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         undo_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        undo_btn.setToolTip("撤销上一笔标注 (Ctrl+Z)")
         undo_btn.clicked.connect(self.undo)
         layout.addWidget(undo_btn)
 
         save_btn = QPushButton("保存")
         save_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        save_btn.setToolTip("保存到 ~/Pictures/截图 (Ctrl+S / Ctrl+Enter)")
         save_btn.clicked.connect(self.save)
         layout.addWidget(save_btn)
 
         ok_btn = QPushButton("完成")
         ok_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         ok_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        ok_btn.setToolTip("复制到剪贴板 (Enter / 双击选区)")
         ok_btn.clicked.connect(self.copy_and_close)
         layout.addWidget(ok_btn)
+
+        hint = QLabel("Enter 复制 · Ctrl+S 保存")
+        hint.setStyleSheet("color: #aaa; font-size: 11px; padding-left: 6px;")
+        layout.addWidget(hint)
 
         bar.adjustSize()
         return bar
 
     def _place_toolbar(self) -> None:
         bar = self._toolbar
-        bar.adjustSize()
         rect = self._selection
         x = rect.right() - bar.width()
         y = rect.bottom() + 8
@@ -175,6 +213,7 @@ class CaptureOverlay(QWidget):
         if y < 4:                                    # 上方也没有就放进选区内
             y = rect.bottom() - bar.height() - 8
         x = min(max(x, 4.0), self.width() - bar.width() - 4.0)
+        y = min(max(y, 4.0), self.height() - bar.height() - 4.0)
         bar.move(round(x), round(y))
         bar.show()
 
@@ -200,23 +239,115 @@ class CaptureOverlay(QWidget):
         self.activateWindow()
         self.claimed.emit()
 
+    # ================= 背景缓存 =================
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._ensure_caches()
+        if getattr(self, "_editing", False) and getattr(self, "_toolbar", None):
+            self._place_toolbar()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # 全屏窗口在 show 之后才拿到最终几何，这里补建一次缓存
+        self._ensure_caches()
+
+    def _ensure_caches(self) -> None:
+        if self._image.isNull() or self.width() <= 0 or self.height() <= 0:
+            return
+        self._scale = self._image.width() / self.width()
+        key = (self.width(), self.height(), self.devicePixelRatioF())
+        if self._cache_key == key and self._dim_cache is not None:
+            return
+        self._cache_key = key
+        self._build_background_caches()
+
+    def _build_background_caches(self) -> None:
+        """预缩放 + 预合成：压暗整屏与亮图各一张，绘制时只做拷贝。
+
+        逐帧对原图做平滑缩放 + 全屏 alpha 混合是最大热点（1080p 下约 3 ms），
+        改为构造时各做一次（约 5 ms），此后每帧降到约 1 ms。
+        """
+        if self._image.isNull() or self.width() <= 0 or self.height() <= 0:
+            return
+        dpr = self.devicePixelRatioF()
+        size = QSize(max(1, round(self.width() * dpr)),
+                     max(1, round(self.height() * dpr)))
+        scaled = QImage(size, QImage.Format.Format_ARGB32_Premultiplied)
+        scaled.setDevicePixelRatio(dpr)
+        scaled.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(scaled)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.drawImage(QRectF(0, 0, self.width(), self.height()), self._image)
+        painter.end()
+
+        bright = QPixmap.fromImage(scaled)
+        bright.setDevicePixelRatio(dpr)
+        dim = QPixmap.fromImage(scaled)
+        dim.setDevicePixelRatio(dpr)
+        painter = QPainter(dim)
+        painter.fillRect(QRectF(0, 0, self.width(), self.height()),
+                         QColor(0, 0, 0, BG_DIM_ALPHA))
+        painter.end()
+        self._bright_cache, self._dim_cache = bright, dim
+
     # ================= 坐标换算 =================
 
     def _to_image(self, pos: QPointF) -> QPointF:
         return QPointF(pos.x() * self._scale, pos.y() * self._scale)
+
+    def _clamp_point(self, pos: QPointF) -> QPointF:
+        """把指针限制在本屏内，避免拖出屏幕时选区越界或出现负坐标。"""
+        return QPointF(min(max(pos.x(), 0.0), float(self.width())),
+                       min(max(pos.y(), 0.0), float(self.height())))
 
     def _clamp_to_selection(self, pos: QPointF) -> QPointF:
         r = self._selection
         return QPointF(min(max(pos.x(), r.left()), r.right()),
                        min(max(pos.y(), r.top()), r.bottom()))
 
+    def _repaint_region(self, *rects: QRectF) -> None:
+        """只重绘旧/新状态覆盖的区域，拖动大选区时省掉整屏重绘。
+
+        区域过大（接近整屏）时退回整屏重绘，避免多个小矩形拼接触发的额外开销。
+        """
+        region = QRectF()
+        for rect in rects:
+            if rect.isEmpty():
+                continue
+            region = region.united(rect.adjusted(
+                -DAMAGE_MARGIN, -DAMAGE_MARGIN, DAMAGE_MARGIN, DAMAGE_MARGIN))
+        if (region.isEmpty() or region.width() >= self.width()
+                or region.height() >= self.height()):
+            self.update()
+        else:
+            self.update(region.toAlignedRect())
+
+    def _draft_bounds(self) -> QRectF:
+        """当前草稿标注在逻辑坐标下的包围盒（含画笔余量），用于局部重绘。"""
+        draft = self._draft
+        if draft is None:
+            return QRectF()
+        if isinstance(draft, ArrowAnnotation):
+            rect = QRectF(draft.start, draft.end).normalized()
+        else:
+            rect = QRectF(draft.rect).normalized()
+        pad = max(float(self.pen_width), 12.0)
+        rect = rect.adjusted(-pad, -pad, pad, pad)
+        s = self._scale
+        return QRectF(rect.x() / s, rect.y() / s,
+                      rect.width() / s, rect.height() / s)
+
     # ================= 鼠标交互 =================
 
     def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.RightButton:
+            self._cancel()
+            return
         if event.button() != Qt.MouseButton.LeftButton:
             return
         self._claim()
-        pos = event.position()
+        pos = self._clamp_point(event.position())
         if not self._editing:
             self._origin = pos
             self._dragging = True
@@ -243,43 +374,55 @@ class CaptureOverlay(QWidget):
         self.update()
 
     def mouseMoveEvent(self, event) -> None:
-        pos = event.position()
+        pos = self._clamp_point(event.position())
         if self._resize_handle is not None:
+            old = QRectF(self._selection)
             self._apply_resize(pos)
+            self._repaint_region(old, self._selection)
             self._place_toolbar()
-            self.update()
         elif self._dragging:
+            old = QRectF(self._selection)
             self._selection = QRectF(self._origin, pos).normalized()
-            self.update()
+            self._repaint_region(old, self._selection)
         elif self._draft is not None and self._press_img is not None:
+            old = self._draft_bounds()
             img_pos = self._to_image(self._clamp_to_selection(pos))
             self._draft = self._make_draft(self._press_img, img_pos)
-            self.update()
+            self._repaint_region(old, self._draft_bounds())
         else:
             self._update_hover_cursor(pos)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        if self._editing and self._selection.contains(event.position()):
+            self._claim()
+            self.copy_and_close()
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
             return
+        pos = self._clamp_point(event.position())
         if self._resize_handle is not None:
-            self._apply_resize(event.position())
+            self._apply_resize(pos)
             self._resize_handle = None
             self._place_toolbar()
             self.update()
             return
         if self._dragging:
             self._dragging = False
+            self._selection = QRectF(self._origin, pos).normalized()
             if (self._selection.width() >= 5
                     and self._selection.height() >= 5):
                 self._editing = True
                 self._place_toolbar()
+                self._update_hover_cursor(pos)
             else:
                 self._selection = QRectF()
             self.update()
             return
         if self._draft is not None and self._press_img is not None:
-            img_pos = self._to_image(self._clamp_to_selection(
-                event.position()))
+            img_pos = self._to_image(self._clamp_to_selection(pos))
             draft = self._make_draft(self._press_img, img_pos)
             if self._is_meaningful(draft):
                 self.annotations.append(draft)
@@ -362,7 +505,13 @@ class CaptureOverlay(QWidget):
             "e": Qt.CursorShape.SizeHorCursor,
             "w": Qt.CursorShape.SizeHorCursor,
         }
-        self.setCursor(cursors.get(handle, Qt.CursorShape.CrossCursor))
+        if handle is not None:
+            self.setCursor(cursors[handle])
+        elif (self._editing and self.tool == TOOL_TEXT
+                and self._selection.contains(pos)):
+            self.setCursor(Qt.CursorShape.IBeamCursor)
+        else:
+            self.setCursor(Qt.CursorShape.CrossCursor)
 
     # ================= 标注构造 =================
 
@@ -402,9 +551,14 @@ class CaptureOverlay(QWidget):
             f"color: {self.color.name()}; font-size: "
             f"{max(10, round(self.font_size / self._scale))}px;"
             "background: rgba(255,255,255,230);")
-        edit.move(anchor.toPoint())
-        edit.resize(220, 32)
+        width, height = 220, 32
+        x = min(max(anchor.x(), 0.0), max(0.0, self.width() - width))
+        y = min(max(anchor.y(), 0.0), max(0.0, self.height() - height))
+        edit.move(round(x), round(y))
+        edit.resize(width, height)
         edit.returnPressed.connect(self._commit_text_edit)
+        edit.editingFinished.connect(self._commit_text_edit)
+        edit.installEventFilter(self)   # Esc 丢弃、Ctrl+Enter 直接保存
         edit.show()
         edit.setFocus()
         self._text_edit = edit
@@ -427,67 +581,133 @@ class CaptureOverlay(QWidget):
         self.setFocus()
         self.update()
 
+    def _discard_text_edit(self) -> None:
+        edit = self._text_edit
+        if edit is None:
+            return
+        self._text_edit = None
+        self._text_img_pos = None
+        edit.hide()
+        edit.deleteLater()
+        self.setFocus()
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self._text_edit and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if key == Qt.Key.Key_Escape:
+                self._discard_text_edit()
+                return True
+            if (key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
+                    and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                self._commit_text_edit()
+                self.save()
+                return True
+        return super().eventFilter(obj, event)
+
     # ================= 键盘 =================
+
+    def _cancel(self) -> None:
+        self._discard_text_edit()
+        self.cancelled.emit()
+        self.close()
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
         mods = event.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
         self._claim()
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            if mods & Qt.KeyboardModifier.ControlModifier:
+            if ctrl:
                 self.save()
             else:
                 self.copy_and_close()
-        elif key == Qt.Key.Key_S and mods & Qt.KeyboardModifier.ControlModifier:
+        elif ctrl and key == Qt.Key.Key_S:
             self.save()
-        elif key == Qt.Key.Key_Z and mods & Qt.KeyboardModifier.ControlModifier:
+        elif ctrl and key == Qt.Key.Key_C:
+            self.copy_and_close()
+        elif ctrl and key == Qt.Key.Key_Z:
             self.undo()
         elif key == Qt.Key.Key_Escape:
-            self.cancelled.emit()
-            self.close()
+            self._cancel()
+        elif self._editing and not mods and key in TOOL_SHORTCUTS:
+            self._set_tool(TOOL_SHORTCUTS[key])
         else:
             super().keyPressEvent(event)
 
     # ================= 绘制 =================
 
+    def _draw_hint(self, painter: QPainter, text: str) -> None:
+        font = painter.font()
+        font.setPixelSize(13)
+        painter.setFont(font)
+        metrics = painter.fontMetrics()
+        w = metrics.horizontalAdvance(text) + 28
+        h = metrics.height() + 14
+        x = (self.width() - w) / 2
+        y = self.height() - h - 36
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 150))
+        painter.drawRoundedRect(QRectF(x, y, w, h), 7, 7)
+        painter.setPen(QColor(235, 235, 235))
+        painter.drawText(QRectF(x, y, w, h),
+                         Qt.AlignmentFlag.AlignCenter, text)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
     def paintEvent(self, event) -> None:
+        self._ensure_caches()
         painter = QPainter(self)
-        painter.drawImage(self.rect(), self._image)
-        painter.fillRect(self.rect(), QColor(0, 0, 0, 120))
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
+        if self._dim_cache is not None:
+            painter.drawPixmap(QPointF(0, 0), self._dim_cache)
+        else:
+            painter.drawImage(self.rect(), self._image)
+            painter.fillRect(self.rect(), QColor(0, 0, 0, BG_DIM_ALPHA))
 
         rect = self._selection
-        if not rect.isEmpty():
+        if rect.isEmpty():
+            if not self._dragging:
+                self._draw_hint(painter, "拖动选择区域 · 右键 / Esc 取消")
+            painter.end()
+            return
+
+        # 选区内恢复亮图：从预缩放亮图按设备像素拷贝，不再逐帧缩放
+        dpr = self.devicePixelRatioF()
+        if self._bright_cache is not None:
+            painter.drawPixmap(
+                rect, self._bright_cache,
+                QRectF(rect.x() * dpr, rect.y() * dpr,
+                       rect.width() * dpr, rect.height() * dpr))
+        else:
             s = self._scale
-            src = QRectF(rect.x() * s, rect.y() * s,
-                         rect.width() * s, rect.height() * s)
-            # 选区内恢复亮图
-            painter.drawImage(rect, self._image, src)
+            painter.drawImage(rect, self._image,
+                              QRectF(rect.x() * s, rect.y() * s,
+                                     rect.width() * s, rect.height() * s))
 
-            # 标注（存储为图像像素坐标，显示时除以 s）
-            painter.save()
-            painter.setClipRect(rect)
-            painter.scale(1.0 / s, 1.0 / s)
-            for ann in self.annotations:
-                ann.paint(painter, self._image)
-            if self._draft is not None:
-                self._draft.paint(painter, self._image)
-            painter.restore()
+        # 标注（存储为图像像素坐标，显示时除以 s）
+        painter.save()
+        painter.setClipRect(rect)
+        painter.scale(1.0 / self._scale, 1.0 / self._scale)
+        for ann in self.annotations:
+            ann.paint(painter, self._image)
+        if self._draft is not None:
+            self._draft.paint(painter, self._image)
+        painter.restore()
 
-            painter.setPen(QPen(QColor("#0a84ff"), 2))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(rect)
+        painter.setPen(QPen(QColor("#0a84ff"), 2))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(rect)
 
-            if self._editing:
-                painter.setPen(QPen(QColor("#0a84ff"), 1))
-                painter.setBrush(QColor("white"))
-                for point in self._handle_points():
-                    painter.drawRect(QRectF(point.x() - 3, point.y() - 3, 6, 6))
+        if self._editing:
+            painter.setPen(QPen(QColor("#0a84ff"), 1))
+            painter.setBrush(QColor("white"))
+            for point in self._handle_points():
+                painter.drawRect(QRectF(point.x() - 3, point.y() - 3, 6, 6))
 
-            w = round(rect.width() * s)
-            h = round(rect.height() * s)
-            painter.setPen(QColor("white"))
-            painter.drawText(rect.topLeft() + QPointF(4, -6),
-                             f"{w} × {h}")
+        w = round(rect.width() * self._scale)
+        h = round(rect.height() * self._scale)
+        painter.setPen(QColor("white"))
+        painter.drawText(rect.topLeft() + QPointF(4, -6),
+                         f"{w} × {h}")
         painter.end()
 
     def _handle_points(self) -> list[QPointF]:

@@ -80,21 +80,30 @@ class TextAnnotation(Annotation):
 class MosaicAnnotation(Annotation):
     rect: QRectF = field(default_factory=QRectF)
     block: int = 12  # 马赛克块大小（图像像素）
+    # 像素化结果缓存：拖完一次后每帧重绘不必再做缩放
+    _cache_key: tuple | None = field(
+        default=None, init=False, repr=False, compare=False)
+    _pixelated: QImage | None = field(
+        default=None, init=False, repr=False, compare=False)
 
     def paint(self, painter: QPainter, base: QImage) -> None:
         rect = self.rect.normalized().toAlignedRect().intersected(base.rect())
         if rect.isEmpty():
             return
-        region = base.copy(rect)
-        small = region.scaled(
-            max(1, rect.width() // self.block),
-            max(1, rect.height() // self.block),
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.FastTransformation,
-        )
-        pixelated = small.scaled(
-            rect.width(), rect.height(),
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.FastTransformation,
-        )
-        painter.drawImage(rect.topLeft(), pixelated)
+        key = (rect.x(), rect.y(), rect.width(), rect.height(),
+               base.cacheKey())
+        if self._pixelated is None or self._cache_key != key:
+            region = base.copy(rect)
+            small = region.scaled(
+                max(1, rect.width() // self.block),
+                max(1, rect.height() // self.block),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+            self._pixelated = small.scaled(
+                rect.width(), rect.height(),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+            self._cache_key = key
+        painter.drawImage(rect.topLeft(), self._pixelated)

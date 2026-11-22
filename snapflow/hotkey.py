@@ -10,6 +10,7 @@ import ctypes
 import ctypes.util
 import logging
 import os
+import select
 
 from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
@@ -48,6 +49,13 @@ def _load_x11():
     x11.XNextEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     x11.XPending.restype = ctypes.c_int
     x11.XPending.argtypes = [ctypes.c_void_p]
+    x11.XSync.restype = ctypes.c_int
+    x11.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XConnectionNumber.restype = ctypes.c_int
+    x11.XConnectionNumber.argtypes = [ctypes.c_void_p]
+    x11.XUngrabKey.restype = ctypes.c_int
+    x11.XUngrabKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint,
+                               ctypes.c_ulong]
     x11.XCloseDisplay.restype = ctypes.c_int
     x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
     return x11
@@ -59,8 +67,11 @@ class _XEvent(ctypes.Structure):
 
 
 KEY_PRESS = 2
-ANY_MODIFIER = 1 << 15
+LOCK_MASK = 1 << 1     # CapsLock
+MOD2_MASK = 1 << 4     # NumLock
 GRAB_MODE_ASYNC = 1
+# 锁键会改变 modifier 组合，标准做法是连同 Lock/Mod2 的四种组合一起抓取
+_GRAB_EXTRAS = (0, LOCK_MASK, MOD2_MASK, LOCK_MASK | MOD2_MASK)
 
 
 class _HotkeyWorker(QThread):
@@ -70,17 +81,20 @@ class _HotkeyWorker(QThread):
         super().__init__(parent)
         self._display = ctypes.c_void_p(display_ptr)
         self._x11 = _load_x11()
+        self._fd = self._x11.XConnectionNumber(self._display)
 
     def run(self) -> None:
         event = _XEvent()
         while not self.isInterruptionRequested():
-            # XNextEvent 阻塞，依赖 XPending 轮询以便响应退出
-            if not self._x11.XPending(self._display):
-                self.msleep(50)
+            # 事件驱动：X 连接可读才处理，按键在毫秒内响应；
+            # 超时只用于周期性检查退出请求，不做忙轮询。
+            ready, _, _ = select.select([self._fd], [], [], 0.2)
+            if not ready:
                 continue
-            self._x11.XNextEvent(self._display, ctypes.byref(event))
-            if event.type == KEY_PRESS:
-                self.triggered.emit()
+            while not self.isInterruptionRequested() and self._x11.XPending(self._display):
+                self._x11.XNextEvent(self._display, ctypes.byref(event))
+                if event.type == KEY_PRESS:
+                    self.triggered.emit()
 
 
 class X11Hotkey(QObject):
@@ -107,8 +121,13 @@ class X11Hotkey(QObject):
             raise RuntimeError(f"无法识别按键名：{key_name}")
         keycode = self._x11.XKeysymToKeycode(self._display, keysym)
         root = self._x11.XDefaultRootWindow(self._display)
-        self._x11.XGrabKey(self._display, keycode, modifiers | ANY_MODIFIER,
-                           root, True, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC)
+        for extra in _GRAB_EXTRAS:
+            self._x11.XGrabKey(self._display, keycode, modifiers | extra,
+                               root, True, GRAB_MODE_ASYNC, GRAB_MODE_ASYNC)
+        # 请求是缓冲发送的，必须 Sync 后才能确保抓取在服务器端生效
+        self._x11.XSync(self._display, False)
+        self._keycode = keycode
+        self._modifiers = modifiers
         log.info("已注册全局热键 %s（keycode=%d）", hotkey, keycode)
 
         self._worker = _HotkeyWorker(self._display, self)
@@ -132,5 +151,10 @@ class X11Hotkey(QObject):
         self._worker.requestInterruption()
         self._worker.wait(1000)
         if self._display:
+            root = self._x11.XDefaultRootWindow(self._display)
+            for extra in _GRAB_EXTRAS:
+                self._x11.XUngrabKey(self._display, self._keycode,
+                                     self._modifiers | extra, root)
+            self._x11.XSync(self._display, False)
             self._x11.XCloseDisplay(self._display)
             self._display = None
