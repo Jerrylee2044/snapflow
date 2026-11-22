@@ -185,7 +185,7 @@ class CaptureOverlay(QWidget):
         save_btn = QPushButton("保存")
         save_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        save_btn.setToolTip("保存到 ~/Pictures/截图 (Ctrl+S / Ctrl+Enter)")
+        save_btn.setToolTip("保存到 ~/Pictures/截图 (Alt+S / Ctrl+Enter)")
         save_btn.clicked.connect(self.save)
         layout.addWidget(save_btn)
 
@@ -196,7 +196,7 @@ class CaptureOverlay(QWidget):
         ok_btn.clicked.connect(self.copy_and_close)
         layout.addWidget(ok_btn)
 
-        hint = QLabel("Enter 复制 · Ctrl+S 保存")
+        hint = QLabel("Enter 复制 · Alt+S 保存")
         hint.setStyleSheet("color: #aaa; font-size: 11px; padding-left: 6px;")
         layout.addWidget(hint)
 
@@ -594,11 +594,17 @@ class CaptureOverlay(QWidget):
     def eventFilter(self, obj, event) -> bool:
         if obj is self._text_edit and event.type() == QEvent.Type.KeyPress:
             key = event.key()
+            mods = event.modifiers()
             if key == Qt.Key.Key_Escape:
                 self._discard_text_edit()
                 return True
             if (key in (Qt.Key.Key_Return, Qt.Key.Key_Enter)
-                    and event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                    and mods & Qt.KeyboardModifier.ControlModifier):
+                self._commit_text_edit()
+                self.save()
+                return True
+            if (key == Qt.Key.Key_S
+                    and mods & Qt.KeyboardModifier.AltModifier):
                 self._commit_text_edit()
                 self.save()
                 return True
@@ -615,13 +621,14 @@ class CaptureOverlay(QWidget):
         key = event.key()
         mods = event.modifiers()
         ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        alt = bool(mods & Qt.KeyboardModifier.AltModifier)
         self._claim()
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if ctrl:
                 self.save()
             else:
                 self.copy_and_close()
-        elif ctrl and key == Qt.Key.Key_S:
+        elif alt and key == Qt.Key.Key_S:
             self.save()
         elif ctrl and key == Qt.Key.Key_C:
             self.copy_and_close()

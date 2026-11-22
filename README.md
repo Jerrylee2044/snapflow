@@ -38,7 +38,7 @@ Alt+A（可自定义） → 拖拽框选 → 标注 → Enter 复制 / Ctrl+Ente
 `snapflow_x.y.z-1_all.deb`：
 
 ```bash
-sudo apt install ./snapflow_0.1.6-1_all.deb   # 自动处理依赖
+sudo apt install ./snapflow_0.1.7-1_all.deb   # 自动处理依赖
 ```
 
 安装后 `snapflow` 命令可用，应用菜单中也能找到 Snapflow 图标。
@@ -79,7 +79,7 @@ python3 -m snapflow capture   # 源码方式运行
 | 文字工具 | 点击选区后直接输入，回车确认；Esc 放弃本次输入 |
 | **Enter** | 复制到剪贴板并退出 |
 | **Ctrl+Enter** | 直接保存到 `~/Pictures/截图/` 并退出（无弹窗） |
-| Ctrl+S | 同 Ctrl+Enter |
+| Alt+S | 同 Ctrl+Enter |
 | Ctrl+C | 同 Enter |
 | Ctrl+Z | 撤销上一笔标注 |
 | 双击选区内 | 直接复制到剪贴板并退出 |

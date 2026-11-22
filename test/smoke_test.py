@@ -248,6 +248,17 @@ QTest.keyClick(edit, Qt.Key.Key_Escape)
 check("文字框 Esc 丢弃输入",
       ov5._text_edit is None and len(ov5.annotations) == 0)
 
+ov6 = CaptureOverlay(base.copy(), PluginRegistry())
+ov6.resize(400, 300)
+ov6.show()
+QTest.mousePress(ov6, Qt.MouseButton.LeftButton, pos=QPoint(40, 40))
+QTest.mouseMove(ov6, QPoint(300, 240))
+QTest.mouseRelease(ov6, Qt.MouseButton.LeftButton, pos=QPoint(300, 240))
+saved = []
+ov6.save = lambda: saved.append(1)
+QTest.keyClick(ov6, Qt.Key.Key_S, modifier=Qt.KeyboardModifier.AltModifier)
+check("Alt+S 保存", len(saved) == 1)
+
 # 3. 插件钩子：加载临时插件目录
 with tempfile.TemporaryDirectory() as d:
     Path(d, "double.py").write_text(textwrap.dedent("""\
