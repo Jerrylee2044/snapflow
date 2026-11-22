@@ -7,8 +7,8 @@ import sys
 import time
 import atexit
 
-from PyQt6.QtCore import QEventLoop, QObject, Qt, QTimer
-from PyQt6.QtGui import QImage
+from PyQt6.QtCore import QEventLoop, QObject, QPoint, QRect, Qt, QTimer
+from PyQt6.QtGui import QCursor, QGuiApplication, QImage
 from PyQt6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from .backends import candidate_backends
@@ -22,6 +22,74 @@ log = logging.getLogger(__name__)
 
 def _noop() -> None:
     return None
+
+
+def screen_for_physical_point(screens, point) -> str | None:
+    """把 X11/XWayland 的物理像素坐标映射到 Qt 屏幕名。
+
+    ``screens`` 为 ``[(name, x, y, w, h, dpr), ...]``（Qt 逻辑坐标）。
+    物理布局按水平排列逐屏累加推算（常见多屏布局），混合 DPI 也能对应上。
+    """
+    ordered = sorted(screens, key=lambda s: (s[1], s[2]))
+    phys_x = 0.0
+    for name, x, y, w, h, dpr in ordered:
+        rect = QRect(round(phys_x), round(y * dpr),
+                     round(w * dpr), round(h * dpr))
+        if rect.contains(point):
+            return name
+        phys_x += w * dpr
+    return None
+
+
+def xdotool_pointer_screen() -> str | None:
+    """经 XWayland 读取全局鼠标物理坐标，返回所在屏幕名。"""
+    import shutil
+    import subprocess
+
+    if shutil.which("xdotool") is None:
+        return None
+    try:
+        proc = subprocess.run(
+            ["xdotool", "getmouselocation", "--shell"],
+            capture_output=True, text=True, timeout=1)
+        if proc.returncode != 0:
+            return None
+        values = dict(
+            line.split("=", 1) for line in proc.stdout.splitlines()
+            if "=" in line)
+        point = QPoint(int(values["X"]), int(values["Y"]))
+    except Exception:  # noqa: BLE001 - 环境不支持就退回其它方式
+        return None
+    screens = [
+        (s.name(), s.geometry().x(), s.geometry().y(),
+         s.geometry().width(), s.geometry().height(), s.devicePixelRatio())
+        for s in QGuiApplication.screens()
+    ]
+    return screen_for_physical_point(screens, point)
+
+
+def crop_to_screen(image: QImage, screen_geometry: QRect,
+                   virtual_geometry: QRect) -> QImage:
+    """把整块虚拟桌面的截图裁成指定屏幕的区域。
+
+    截图后端返回的是全部显示器合并后的图像，尺寸与逻辑坐标未必 1:1
+    （GNOME 下实测为统一缩放），因此按图像/虚拟桌面的比例换算。
+    """
+    if virtual_geometry.width() <= 0 or virtual_geometry.height() <= 0:
+        return image
+    sx = image.width() / virtual_geometry.width()
+    sy = image.height() / virtual_geometry.height()
+    rect = QRect(
+        round((screen_geometry.x() - virtual_geometry.x()) * sx),
+        round((screen_geometry.y() - virtual_geometry.y()) * sy),
+        round(screen_geometry.width() * sx),
+        round(screen_geometry.height() * sy),
+    ).intersected(image.rect())
+    if rect.isEmpty():
+        return image
+    if rect == image.rect():
+        return image
+    return image.copy(rect)
 
 
 class SnapflowApp(QObject):
@@ -54,6 +122,8 @@ class SnapflowApp(QObject):
             return
         self._busy = True
         started = time.monotonic()
+        screen = self._target_screen()
+        log.info("目标屏幕：%s %s", screen.name(), screen.geometry())
         restore_animations = self._suppress_animations()
         helper = self._focus_helper_for_portal()
         shot = self._grab()
@@ -62,11 +132,29 @@ class SnapflowApp(QObject):
         if shot is None:
             restore_animations()
             return
-        log.info("抓屏完成：%.0f ms", (time.monotonic() - started) * 1000)
+        virtual = QGuiApplication.primaryScreen().virtualGeometry()
+        shot = crop_to_screen(shot, screen.geometry(), virtual)
+        log.info("抓屏完成：%.0f ms（%s）",
+                 (time.monotonic() - started) * 1000, screen.name())
         shot = self.plugins.on_captured(shot)
-        self._open_overlay(shot)
+        self._open_overlay(shot, screen)
         # 等覆盖层完成映射后再恢复动画，避免窗口打开动画
         QTimer.singleShot(150, restore_animations)
+
+    @staticmethod
+    def _target_screen():
+        """鼠标所在屏幕；取不到时退回主屏。"""
+        name = xdotool_pointer_screen()
+        if name is not None:
+            for screen in QGuiApplication.screens():
+                if screen.name() == name:
+                    return screen
+        pos = QCursor.pos()
+        if pos != QPoint(0, 0):
+            screen = QGuiApplication.screenAt(pos)
+            if screen is not None:
+                return screen
+        return QGuiApplication.primaryScreen()
 
     # ---- 快门闪光抑制 ----
 
@@ -173,8 +261,8 @@ class SnapflowApp(QObject):
         self._maybe_quit()
         return None
 
-    def _open_overlay(self, shot: QImage) -> None:
-        overlay = CaptureOverlay(shot, self.plugins)
+    def _open_overlay(self, shot: QImage, screen) -> None:
+        overlay = CaptureOverlay(shot, self.plugins, screen=screen)
         overlay.finished.connect(self._reset)
         overlay.cancelled.connect(self._reset)
         overlay.destroyed.connect(self._clear_overlay)

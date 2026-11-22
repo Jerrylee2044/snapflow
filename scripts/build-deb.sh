@@ -83,7 +83,7 @@ Priority: optional
 Architecture: all
 Maintainer: jerrylee <jerrylee@localhost>
 Depends: python3, python3-pyqt6, python3-dbus-next, wl-clipboard | xclip
-Recommends: grim
+Recommends: grim, xdotool
 Description: 截图与标注工具（X11 优先，Wayland 经 XDG Portal / grim 兜底）
  微信式单层交互：拖拽框选后在选区旁直接标注（矩形/箭头/文字/马赛克），
  Enter 复制到剪贴板，Ctrl+Enter 保存到 ~/Pictures/截图/。

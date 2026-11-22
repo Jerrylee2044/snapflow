@@ -220,6 +220,17 @@ QT_QPA_PLATFORM=offscreen python3 test/smoke_test.py
 file:// URI 解码）、覆盖层的框选与三类标注、马赛克像素验证、插件钩子、
 Wayland 热键拒绝。
 
+## 多显示器
+
+按**鼠标所在屏幕**截图：覆盖层只覆盖那一块屏，图像按该屏裁剪，
+不会把多屏拼成一张图压进单屏（Wayland 全屏窗口也只能占一块屏）。
+屏幕判定优先经 XWayland 的 `xdotool getmouselocation` 读取真实全局坐标，
+再映射到 Qt 屏幕（混合 DPI 已处理）；不可用时退回 Qt 光标位置/主屏。
+
+> 说明：Wayland 下 `xdotool` 通过 XWayland 提供坐标，建议安装
+> （`sudo apt install xdotool`，deb 中为 Recommends）。目前按水平排列
+> 推算物理布局，垂直堆叠的多屏可能判定不准。
+
 ## 已知限制
 
 - 文字标注暂不支持选中后二次编辑，Ctrl+Z 可回退

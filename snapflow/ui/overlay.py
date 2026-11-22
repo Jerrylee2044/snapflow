@@ -49,7 +49,8 @@ class CaptureOverlay(QWidget):
     finished = pyqtSignal()
     cancelled = pyqtSignal()
 
-    def __init__(self, screenshot: QImage, plugins: PluginRegistry) -> None:
+    def __init__(self, screenshot: QImage, plugins: PluginRegistry,
+                 screen=None) -> None:
         super().__init__(
             None,
             Qt.WindowType.FramelessWindowHint
@@ -62,7 +63,10 @@ class CaptureOverlay(QWidget):
 
         self._image = screenshot
         self._plugins = plugins
-        geometry = QGuiApplication.primaryScreen().virtualGeometry()
+        screen = screen or QGuiApplication.primaryScreen()
+        # 覆盖层只盖鼠标所在的那一块屏（Wayland 全屏窗口也只能占一块屏）
+        self.setScreen(screen)
+        geometry = screen.geometry()
         self.setGeometry(geometry)
         # 图像像素 / 逻辑坐标 的换算系数（HiDPI 下通常 >1）
         self._scale = (screenshot.width() / geometry.width()
