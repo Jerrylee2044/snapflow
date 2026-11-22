@@ -48,6 +48,7 @@ class CaptureOverlay(QWidget):
 
     finished = pyqtSignal()
     cancelled = pyqtSignal()
+    claimed = pyqtSignal()   # 用户在本覆盖层开始操作（用于关闭其它屏幕的覆盖层）
 
     def __init__(self, screenshot: QImage, plugins: PluginRegistry,
                  screen=None) -> None:
@@ -89,6 +90,7 @@ class CaptureOverlay(QWidget):
 
         self._text_edit: QLineEdit | None = None
         self._text_img_pos: QPointF | None = None
+        self._claimed = False
 
         # ---- 选区调整状态（逻辑坐标） ----
         self._resize_handle: str | None = None
@@ -189,6 +191,15 @@ class CaptureOverlay(QWidget):
         self.color = QColor(hexcolor)
         self.setFocus()
 
+    def _claim(self) -> None:
+        """本屏成为本次截图的交互目标，通知应用关闭其它屏幕的覆盖层。"""
+        if self._claimed:
+            return
+        self._claimed = True
+        self.raise_()
+        self.activateWindow()
+        self.claimed.emit()
+
     # ================= 坐标换算 =================
 
     def _to_image(self, pos: QPointF) -> QPointF:
@@ -204,6 +215,7 @@ class CaptureOverlay(QWidget):
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
             return
+        self._claim()
         pos = event.position()
         if not self._editing:
             self._origin = pos
@@ -420,6 +432,7 @@ class CaptureOverlay(QWidget):
     def keyPressEvent(self, event) -> None:
         key = event.key()
         mods = event.modifiers()
+        self._claim()
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if mods & Qt.KeyboardModifier.ControlModifier:
                 self.save()

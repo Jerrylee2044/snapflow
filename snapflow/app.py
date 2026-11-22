@@ -7,8 +7,8 @@ import sys
 import time
 import atexit
 
-from PyQt6.QtCore import QEventLoop, QObject, QPoint, QRect, Qt, QTimer
-from PyQt6.QtGui import QCursor, QGuiApplication, QImage
+from PyQt6.QtCore import QEventLoop, QObject, QRect, Qt, QTimer
+from PyQt6.QtGui import QGuiApplication, QImage
 from PyQt6.QtWidgets import QApplication, QMessageBox, QWidget
 
 from .backends import candidate_backends
@@ -27,8 +27,8 @@ def _noop() -> None:
 def screen_for_physical_point(screens, point) -> str | None:
     """把 X11/XWayland 的物理像素坐标映射到 Qt 屏幕名。
 
-    ``screens`` 为 ``[(name, x, y, w, h, dpr), ...]``（Qt 逻辑坐标）。
-    物理布局按水平排列逐屏累加推算（常见多屏布局），混合 DPI 也能对应上。
+    保留为调试工具：Wayland 下 XWayland 的指针坐标只随 X11 窗口更新，
+    不能用于可靠判定光标所在屏幕，正式流程不再使用。
     """
     ordered = sorted(screens, key=lambda s: (s[1], s[2]))
     phys_x = 0.0
@@ -39,33 +39,6 @@ def screen_for_physical_point(screens, point) -> str | None:
             return name
         phys_x += w * dpr
     return None
-
-
-def xdotool_pointer_screen() -> str | None:
-    """经 XWayland 读取全局鼠标物理坐标，返回所在屏幕名。"""
-    import shutil
-    import subprocess
-
-    if shutil.which("xdotool") is None:
-        return None
-    try:
-        proc = subprocess.run(
-            ["xdotool", "getmouselocation", "--shell"],
-            capture_output=True, text=True, timeout=1)
-        if proc.returncode != 0:
-            return None
-        values = dict(
-            line.split("=", 1) for line in proc.stdout.splitlines()
-            if "=" in line)
-        point = QPoint(int(values["X"]), int(values["Y"]))
-    except Exception:  # noqa: BLE001 - 环境不支持就退回其它方式
-        return None
-    screens = [
-        (s.name(), s.geometry().x(), s.geometry().y(),
-         s.geometry().width(), s.geometry().height(), s.devicePixelRatio())
-        for s in QGuiApplication.screens()
-    ]
-    return screen_for_physical_point(screens, point)
 
 
 def crop_to_screen(image: QImage, screen_geometry: QRect,
@@ -104,6 +77,7 @@ class SnapflowApp(QObject):
         self.one_shot = one_shot
         self._busy = False
         self._overlay: CaptureOverlay | None = None
+        self._overlays: list[CaptureOverlay] = []
         self._portal_permission: bool | None = None
         self._pending_restore = None
         self._config = config.load()
@@ -122,8 +96,6 @@ class SnapflowApp(QObject):
             return
         self._busy = True
         started = time.monotonic()
-        screen = self._target_screen()
-        log.info("目标屏幕：%s %s", screen.name(), screen.geometry())
         restore_animations = self._suppress_animations()
         helper = self._focus_helper_for_portal()
         shot = self._grab()
@@ -132,29 +104,62 @@ class SnapflowApp(QObject):
         if shot is None:
             restore_animations()
             return
-        virtual = QGuiApplication.primaryScreen().virtualGeometry()
-        shot = crop_to_screen(shot, screen.geometry(), virtual)
-        log.info("抓屏完成：%.0f ms（%s）",
-                 (time.monotonic() - started) * 1000, screen.name())
+        log.info("抓屏完成：%.0f ms", (time.monotonic() - started) * 1000)
         shot = self.plugins.on_captured(shot)
-        self._open_overlay(shot, screen)
+        self._open_overlays(shot)
         # 等覆盖层完成映射后再恢复动画，避免窗口打开动画
         QTimer.singleShot(150, restore_animations)
 
-    @staticmethod
-    def _target_screen():
-        """鼠标所在屏幕；取不到时退回主屏。"""
-        name = xdotool_pointer_screen()
-        if name is not None:
-            for screen in QGuiApplication.screens():
-                if screen.name() == name:
-                    return screen
-        pos = QCursor.pos()
-        if pos != QPoint(0, 0):
-            screen = QGuiApplication.screenAt(pos)
-            if screen is not None:
-                return screen
-        return QGuiApplication.primaryScreen()
+    # ---- 覆盖层会话 ----
+
+    def _open_overlays(self, shot: QImage) -> None:
+        """每块屏幕各一个覆盖层，用户在哪个屏操作就截哪个屏。
+
+        Wayland 下应用拿不到可靠的全局光标位置（XWayland 的指针坐标
+        只随 X11 窗口更新），因此不用光标判定屏幕，改为多覆盖层方案。
+        """
+        virtual = QGuiApplication.primaryScreen().virtualGeometry()
+        self._overlays = []
+        for screen in QGuiApplication.screens():
+            image = crop_to_screen(shot, screen.geometry(), virtual)
+            overlay = CaptureOverlay(image, self.plugins, screen=screen)
+            overlay.claimed.connect(
+                lambda ov=overlay: self._claim_overlay(ov))
+            overlay.finished.connect(self._end_session)
+            overlay.cancelled.connect(self._end_session)
+            overlay.destroyed.connect(
+                lambda _obj=None, ov=overlay: self._overlay_destroyed(ov))
+            self._overlays.append(overlay)
+            log.info("覆盖层：%s %s", screen.name(), screen.geometry())
+
+        for overlay in self._overlays:
+            overlay.showFullScreen()
+            overlay.raise_()
+        if self._overlays:
+            self._overlays[0].activateWindow()
+            self._overlays[0].setFocus()
+
+    def _claim_overlay(self, winner: CaptureOverlay) -> None:
+        for overlay in list(self._overlays):
+            if overlay is not winner and overlay.isVisible():
+                self._overlays.remove(overlay)
+                overlay.close()
+
+    def _overlay_destroyed(self, overlay: CaptureOverlay) -> None:
+        if overlay in self._overlays:
+            self._overlays.remove(overlay)
+        if not self._overlays and self._busy:
+            self._end_session()
+
+    def _end_session(self) -> None:
+        if not self._overlays:
+            if self._busy:
+                self._reset()
+            return
+        overlays, self._overlays = self._overlays, []
+        for overlay in overlays:
+            overlay.close()
+        self._reset()
 
     # ---- 快门闪光抑制 ----
 
@@ -261,25 +266,11 @@ class SnapflowApp(QObject):
         self._maybe_quit()
         return None
 
-    def _open_overlay(self, shot: QImage, screen) -> None:
-        overlay = CaptureOverlay(shot, self.plugins, screen=screen)
-        overlay.finished.connect(self._reset)
-        overlay.cancelled.connect(self._reset)
-        overlay.destroyed.connect(self._clear_overlay)
-        self._overlay = overlay
-        overlay.showFullScreen()
-        overlay.raise_()
-        overlay.activateWindow()
-        overlay.setFocus()
-
     # ---- 状态 ----
 
     def _reset(self) -> None:
         self._busy = False
         self._maybe_quit()
-
-    def _clear_overlay(self) -> None:
-        self._overlay = None
 
     def _maybe_quit(self) -> None:
         if self.one_shot:

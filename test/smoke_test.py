@@ -86,7 +86,7 @@ check("uri 百分号解码",
 
 # 1c. 多屏：按目标屏幕裁剪整块桌面截图
 from PyQt6.QtCore import QRect
-from snapflow.app import crop_to_screen, screen_for_physical_point
+from snapflow.app import crop_to_screen
 
 wide = QImage(1000, 500, QImage.Format.Format_ARGB32)
 wide.fill(QColor("red"))
@@ -102,16 +102,6 @@ check("多屏裁剪取到右屏像素",
       QColor(right_img.pixel(10, 10)) == QColor("blue"))
 check("单屏时不裁剪", crop_to_screen(wide, virtual_geo, virtual_geo)
       .size() == wide.size())
-
-# 1d. 鼠标物理坐标 -> 屏幕（混合 DPI：HDMI 1x + eDP 2x）
-dual = [("HDMI-1", 0, 0, 1920, 1080, 1.0),
-        ("eDP-1", 1920, 0, 1536, 960, 2.0)]
-check("物理坐标命中左屏",
-      screen_for_physical_point(dual, QPoint(500, 500)) == "HDMI-1")
-check("物理坐标命中右屏（2x）",
-      screen_for_physical_point(dual, QPoint(3003, 1886)) == "eDP-1")
-check("物理坐标越界返回 None",
-      screen_for_physical_point(dual, QPoint(6000, 10)) is None)
 
 # 2. 覆盖层：构造 + 框选 + 标注（替代旧 selector/editor 测试）
 base = QImage(400, 300, QImage.Format.Format_ARGB32)
